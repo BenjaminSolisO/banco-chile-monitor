@@ -46,7 +46,7 @@ TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 BANCO_CHILE_DOMAINS = ["@bancochile.cl", "@banchile.cl"]
 
 # Emails recibidos hace más de estos minutos se ignoran (evita ruido al reiniciar)
-MAX_AGE_MINUTES = 5
+MAX_AGE_MINUTES = 15
 
 IDLE_TIMEOUT   = 29 * 60   # 29 min — el servidor puede cortar a los 30 min
 RECONNECT_WAIT = 5          # segundos antes de reconectar tras un error
@@ -321,9 +321,10 @@ def monitor() -> None:
                         log.debug(f"Respuesta IDLE: {responses}")
                         client.idle_done()
 
-                        # Filtrar en el servidor: solo no-leídos de HOY con UID > watermark
+                        # Filtrar solo mensajes con UID > watermark (nuevos desde que arrancó el bot).
+                        # No se usa UNSEEN para no perder alertas que ya fueron leídas en Gmail.
                         today_str = datetime.now().strftime("%d-%b-%Y")
-                        all_current = client.search(["UNSEEN", "SINCE", today_str])
+                        all_current = client.search(["SINCE", today_str])
                         new_uids = [uid for uid in all_current if uid > watermark]
                         if new_uids:
                             log.info(f"{len(new_uids)} mensaje(s) nuevo(s) hoy.")

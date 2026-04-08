@@ -1,2 +1,4 @@
 imapclient
 requests
+gspread
+google-auth
