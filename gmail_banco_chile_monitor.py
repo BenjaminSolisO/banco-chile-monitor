@@ -25,7 +25,7 @@ import os
 import re
 import time
 from email.header import decode_header
-from datetime import datetime
+from datetime import datetime, timezone
 
 import requests
 from imapclient import IMAPClient
@@ -142,8 +142,6 @@ def is_banco_chile_alert(sender: str) -> bool:
 def is_recent(date_str: str) -> bool:
     """Devuelve True si el email fue recibido hace menos de MAX_AGE_MINUTES minutos."""
     try:
-        import email.utils
-        from datetime import timezone
         dt = email.utils.parsedate_to_datetime(date_str)
         # Normalizar a UTC para comparar
         if dt.tzinfo is None:
