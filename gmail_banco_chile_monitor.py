@@ -290,11 +290,18 @@ def monitor() -> None:
                 log.info("Sesion abierta. Entrando en IDLE …")
 
                 # Registrar el UID más alto actual como marca de agua.
-                # Solo se procesarán mensajes con UID MAYOR a este valor,
-                # ignorando todos los no-leídos acumulados anteriormente.
                 all_uids = client.search(["ALL"])
                 watermark = max(all_uids) if all_uids else 0
-                log.info(f"Marca de agua inicial: UID {watermark}. Solo se procesaran mensajes nuevos.")
+                log.info(f"Marca de agua inicial: UID {watermark}.")
+
+                # Recuperación al arrancar: procesar emails recientes perdidos durante
+                # un posible reinicio (is_recent() filtra los más viejos de 15 min).
+                today_str = datetime.now().strftime("%d-%b-%Y")
+                startup_uids = client.search(["SINCE", today_str])
+                if startup_uids:
+                    log.info(f"Revisando {len(startup_uids)} email(s) de hoy al arrancar …")
+                    for uid in startup_uids:
+                        process_uid(client, uid)
 
                 # Entrar en modo IDLE
                 client.idle()
@@ -312,26 +319,26 @@ def monitor() -> None:
                         idle_start = time.monotonic()
                         continue
 
-                    # Esperar actividad del servidor (tick cada 60 s máximo)
+                    # Esperar actividad del servidor (tick cada 60 s máximo).
+                    # Aunque no llegue notificación IDLE, el timeout actúa como poll.
                     responses = client.idle_check(timeout=min(remaining, 60))
-
                     if responses:
                         log.debug(f"Respuesta IDLE: {responses}")
-                        client.idle_done()
 
-                        # Filtrar solo mensajes con UID > watermark (nuevos desde que arrancó el bot).
-                        # No se usa UNSEEN para no perder alertas que ya fueron leídas en Gmail.
-                        today_str = datetime.now().strftime("%d-%b-%Y")
-                        all_current = client.search(["SINCE", today_str])
-                        new_uids = [uid for uid in all_current if uid > watermark]
-                        if new_uids:
-                            log.info(f"{len(new_uids)} mensaje(s) nuevo(s) hoy.")
-                        for uid in new_uids:
-                            process_uid(client, uid)
-                            watermark = max(watermark, uid)
+                    client.idle_done()
 
-                        client.idle()
-                        idle_start = time.monotonic()
+                    # Buscar siempre, con o sin evento IDLE
+                    today_str = datetime.now().strftime("%d-%b-%Y")
+                    all_current = client.search(["SINCE", today_str])
+                    new_uids = [uid for uid in all_current if uid > watermark]
+                    if new_uids:
+                        log.info(f"{len(new_uids)} mensaje(s) nuevo(s) hoy.")
+                    for uid in new_uids:
+                        process_uid(client, uid)
+                        watermark = max(watermark, uid)
+
+                    client.idle()
+                    idle_start = time.monotonic()
 
         except KeyboardInterrupt:
             log.info("Detenido por el usuario.")
