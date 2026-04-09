@@ -200,9 +200,17 @@ def extract_alert_info(subject: str, body: str) -> dict:
     }
 
 
-DIAS_ES   = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
-MESES_ES  = ["enero", "febrero", "marzo", "abril", "mayo", "junio",
-             "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+DIAS_ES    = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
+MESES_ES   = ["enero", "febrero", "marzo", "abril", "mayo", "junio",
+              "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+MESES_IMAP = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+              "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def imap_today() -> str:
+    """Fecha de hoy en formato IMAP (ej: 08-Apr-2026), sin depender del locale del sistema."""
+    d = datetime.now()
+    return f"{d.day:02d}-{MESES_IMAP[d.month - 1]}-{d.year}"
 
 def format_date_es(date_str: str) -> str:
     """Convierte un header Date de email a 'Miércoles 7 de abril'."""
@@ -239,8 +247,11 @@ def build_telegram_message(subject: str, sender: str, date: str, info: dict) -> 
 
 # ─── Procesamiento de mensajes ─────────────────────────────────────────────────
 
-def process_uid(client: IMAPClient, uid: int) -> None:
-    """Descarga y procesa un email por su UID."""
+def process_uid(client: IMAPClient, uid: int, check_age: bool = True) -> None:
+    """Descarga y procesa un email por su UID.
+    check_age=False en el loop de poll (ya filtrado por watermark).
+    check_age=True en startup para no reprocesar emails viejos.
+    """
     try:
         data = client.fetch([uid], ["RFC822"])
         raw  = data[uid][b"RFC822"]
@@ -250,18 +261,19 @@ def process_uid(client: IMAPClient, uid: int) -> None:
         subject = decode_header_str(msg.get("Subject", ""))
         date    = msg.get("Date", "")
 
-        log.info(f"Nuevo mensaje — De: {sender!r} | Asunto: {subject!r}")
+        log.info(f"UID {uid} — De: {sender!r} | Asunto: {subject!r}")
 
         if not is_banco_chile_alert(sender):
-            log.debug("Remitente no es Banco de Chile, ignorado.")
+            log.info(f"UID {uid} — remitente no es Banco de Chile, ignorado.")
             return
 
-        if not is_recent(date):
-            log.info("Email demasiado antiguo, ignorado.")
+        if check_age and not is_recent(date):
+            log.info(f"UID {uid} — email demasiado antiguo, ignorado.")
             return
 
         body = get_body(msg)
         info = extract_alert_info(subject, body)
+        log.info(f"UID {uid} — alerta detectada: monto={info['monto']!r} comercio={info['comercio']!r}")
         text = build_telegram_message(subject, sender, date, info)
         send_telegram(text)
 
@@ -296,12 +308,11 @@ def monitor() -> None:
 
                 # Recuperación al arrancar: procesar emails recientes perdidos durante
                 # un posible reinicio (is_recent() filtra los más viejos de 15 min).
-                today_str = datetime.now().strftime("%d-%b-%Y")
-                startup_uids = client.search(["SINCE", today_str])
+                startup_uids = client.search(["SINCE", imap_today()])
                 if startup_uids:
                     log.info(f"Revisando {len(startup_uids)} email(s) de hoy al arrancar …")
                     for uid in startup_uids:
-                        process_uid(client, uid)
+                        process_uid(client, uid, check_age=True)
 
                 # Entrar en modo IDLE
                 client.idle()
@@ -322,19 +333,16 @@ def monitor() -> None:
                     # Esperar actividad del servidor (tick cada 60 s máximo).
                     # Aunque no llegue notificación IDLE, el timeout actúa como poll.
                     responses = client.idle_check(timeout=min(remaining, 60))
-                    if responses:
-                        log.debug(f"Respuesta IDLE: {responses}")
+                    log.info(f"idle_check: {'evento recibido' if responses else 'timeout 60s'}")
 
                     client.idle_done()
 
                     # Buscar siempre, con o sin evento IDLE
-                    today_str = datetime.now().strftime("%d-%b-%Y")
-                    all_current = client.search(["SINCE", today_str])
+                    all_current = client.search(["SINCE", imap_today()])
                     new_uids = [uid for uid in all_current if uid > watermark]
-                    if new_uids:
-                        log.info(f"{len(new_uids)} mensaje(s) nuevo(s) hoy.")
+                    log.info(f"Poll: {len(all_current)} email(s) hoy, {len(new_uids)} nuevo(s) (watermark={watermark}).")
                     for uid in new_uids:
-                        process_uid(client, uid)
+                        process_uid(client, uid, check_age=False)
                         watermark = max(watermark, uid)
 
                     client.idle()
