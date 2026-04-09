@@ -25,7 +25,7 @@ import os
 import re
 import time
 from email.header import decode_header
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
 from imapclient import IMAPClient
@@ -207,9 +207,11 @@ MESES_IMAP = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
 
-def imap_today() -> str:
-    """Fecha de hoy en formato IMAP (ej: 08-Apr-2026), sin depender del locale del sistema."""
-    d = datetime.now()
+def imap_since() -> str:
+    """Fecha de ayer en formato IMAP (ej: 08-Apr-2026), sin depender del locale del sistema.
+    Usar ayer en vez de hoy cubre el desfase entre UTC del servidor y la hora local de Chile:
+    emails que llegan antes de medianoche UTC tienen fecha interna del día anterior."""
+    d = datetime.now() - timedelta(days=1)
     return f"{d.day:02d}-{MESES_IMAP[d.month - 1]}-{d.year}"
 
 def format_date_es(date_str: str) -> str:
@@ -308,7 +310,7 @@ def monitor() -> None:
 
                 # Recuperación al arrancar: procesar emails recientes perdidos durante
                 # un posible reinicio (is_recent() filtra los más viejos de 15 min).
-                startup_uids = client.search(["SINCE", imap_today()])
+                startup_uids = client.search(["SINCE", imap_since()])
                 if startup_uids:
                     log.info(f"Revisando {len(startup_uids)} email(s) de hoy al arrancar …")
                     for uid in startup_uids:
@@ -338,7 +340,7 @@ def monitor() -> None:
                     client.idle_done()
 
                     # Buscar siempre, con o sin evento IDLE
-                    all_current = client.search(["SINCE", imap_today()])
+                    all_current = client.search(["SINCE", imap_since()])
                     new_uids = [uid for uid in all_current if uid > watermark]
                     log.info(f"Poll: {len(all_current)} email(s) hoy, {len(new_uids)} nuevo(s) (watermark={watermark}).")
                     for uid in new_uids:
