@@ -20,14 +20,18 @@ Uso:
 
 import email
 import email.utils
+import json
 import logging
 import os
 import re
+import threading
 import time
 from email.header import decode_header
 from datetime import datetime, timezone, timedelta
 
+import gspread
 import requests
+from google.oauth2.service_account import Credentials
 from imapclient import IMAPClient
 
 # ─── Configuración ────────────────────────────────────────────────────────────
@@ -40,7 +44,10 @@ GMAIL_PASSWORD = os.environ.get("GMAIL_PASSWORD", "")  # contraseña de aplicaci
 
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+
+GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
+GOOGLE_SHEET_ID         = os.environ.get("GOOGLE_SHEET_ID", "")
 
 # Dominios aceptados — solo emails cuyo remitente termine en uno de estos
 BANCO_CHILE_DOMAINS = ["@bancochile.cl", "@banchile.cl"]
@@ -51,6 +58,11 @@ MAX_AGE_MINUTES = 15
 IDLE_TIMEOUT   = 29 * 60   # 29 min — el servidor puede cortar a los 30 min
 RECONNECT_WAIT = 5          # segundos antes de reconectar tras un error
 
+# ─── Estado global (compra pendiente de clasificar) ───────────────────────────
+
+pending_purchase = None   # dict: {fecha, monto, comercio}
+pending_lock     = threading.Lock()
+
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -59,6 +71,43 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
+
+
+# ─── Google Sheets ────────────────────────────────────────────────────────────
+
+SHEET_HEADER = ["Fecha", "Monto", "Comercio (banco)", "¿Qué compraste?", "¿Dónde?"]
+
+
+def get_sheet():
+    scopes     = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+    creds      = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    gc         = gspread.authorize(creds)
+    return gc.open_by_key(GOOGLE_SHEET_ID).sheet1
+
+
+def ensure_header(sheet) -> None:
+    """Crea la fila de encabezado si la hoja está vacía."""
+    if not sheet.row_values(1):
+        sheet.append_row(SHEET_HEADER)
+
+
+def save_to_sheets(purchase: dict, que: str, donde: str) -> bool:
+    try:
+        sheet = get_sheet()
+        ensure_header(sheet)
+        sheet.append_row([
+            purchase["fecha"],
+            purchase["monto"],
+            purchase["comercio"],
+            que,
+            donde,
+        ])
+        log.info("Gasto guardado en Google Sheets.")
+        return True
+    except Exception as exc:
+        log.error(f"Error guardando en Sheets: {exc}")
+        return False
 
 
 # ─── Telegram ─────────────────────────────────────────────────────────────────
@@ -71,13 +120,79 @@ def send_telegram(text: str) -> bool:
         "parse_mode": "HTML",
     }
     try:
-        resp = requests.post(TELEGRAM_API_URL, json=payload, timeout=10)
+        resp = requests.post(f"{TELEGRAM_API_URL}/sendMessage", json=payload, timeout=10)
         resp.raise_for_status()
         log.info("Notificacion Telegram enviada.")
         return True
     except requests.RequestException as exc:
         log.error(f"Error enviando a Telegram: {exc}")
         return False
+
+
+def get_telegram_updates(offset: int) -> list:
+    try:
+        resp = requests.get(
+            f"{TELEGRAM_API_URL}/getUpdates",
+            params={"offset": offset, "timeout": 30},
+            timeout=35,
+        )
+        resp.raise_for_status()
+        return resp.json().get("result", [])
+    except requests.RequestException:
+        return []
+
+
+def handle_reply(text: str) -> None:
+    global pending_purchase
+
+    with pending_lock:
+        if pending_purchase is None:
+            return  # no hay compra pendiente, ignorar mensaje
+
+        if "/" not in text:
+            send_telegram(
+                "Formato incorrecto. Responde así:\n"
+                "<code>qué compraste / dónde</code>\n"
+                "Ej: <code>ropa / Falabella</code>"
+            )
+            return
+
+        parts    = text.split("/", 1)
+        que      = parts[0].strip()
+        donde    = parts[1].strip()
+        purchase = pending_purchase
+        pending_purchase = None
+
+    ok = save_to_sheets(purchase, que, donde)
+    if ok:
+        send_telegram(
+            f"Guardado en Google Sheets.\n"
+            f"<b>{que}</b> en <b>{donde}</b> — <b>${purchase['monto']}</b>"
+        )
+    else:
+        send_telegram("Error al guardar en Google Sheets. Intenta responder de nuevo.")
+        with pending_lock:
+            pending_purchase = purchase  # restaurar para reintentar
+
+
+def telegram_polling() -> None:
+    """Hilo que escucha respuestas del usuario en Telegram (long polling)."""
+    log.info("Polling de Telegram iniciado.")
+    last_update_id = 0
+    while True:
+        updates = get_telegram_updates(last_update_id)
+        for upd in updates:
+            last_update_id = upd["update_id"] + 1
+            msg = upd.get("message") or upd.get("edited_message")
+            if not msg:
+                continue
+            text    = msg.get("text", "").strip()
+            chat_id = str(msg.get("chat", {}).get("id", ""))
+            if chat_id != str(TELEGRAM_CHAT_ID):
+                continue
+            if text:
+                handle_reply(text)
+        time.sleep(2)
 
 
 # ─── Utilidades de email ───────────────────────────────────────────────────────
@@ -226,25 +341,17 @@ def format_date_es(date_str: str) -> str:
 
 
 def build_telegram_message(subject: str, sender: str, date: str, info: dict) -> str:
-    monto      = info["monto"]
-    fecha      = format_date_es(date)
+    monto = info["monto"]
+    fecha = format_date_es(date)
 
-    if monto == "N/D":
-        return (
-            f"<b>Alerta Banco de Chile</b>\n"
-            f"<b>Fecha:</b> {fecha}\n"
-            f"<b>Asunto:</b> {subject}\n\n"
-            f"¿Qué compraste?\n"
-            f"¿Dónde?"
-        )
+    base = f"<b>Alerta Banco de Chile</b>\n<b>Fecha:</b> {fecha}\n"
+    if monto != "N/D":
+        base += f"<b>Monto:</b> ${monto}\n"
+    else:
+        base += f"<b>Asunto:</b> {subject}\n"
 
-    return (
-        f"<b>Alerta Banco de Chile</b>\n"
-        f"<b>Monto:</b> ${monto}\n"
-        f"<b>Fecha:</b> {fecha}\n\n"
-        f"¿Qué compraste?\n"
-        f"¿Dónde?"
-    )
+    base += "\nResponde: <code>qué compraste / dónde</code>"
+    return base
 
 
 # ─── Procesamiento de mensajes ─────────────────────────────────────────────────
@@ -254,6 +361,7 @@ def process_uid(client: IMAPClient, uid: int, check_age: bool = True) -> None:
     check_age=False en el loop de poll (ya filtrado por watermark).
     check_age=True en startup para no reprocesar emails viejos.
     """
+    global pending_purchase
     try:
         data = client.fetch([uid], ["RFC822"])
         raw  = data[uid][b"RFC822"]
@@ -276,6 +384,14 @@ def process_uid(client: IMAPClient, uid: int, check_age: bool = True) -> None:
         body = get_body(msg)
         info = extract_alert_info(subject, body)
         log.info(f"UID {uid} — alerta detectada: monto={info['monto']!r} comercio={info['comercio']!r}")
+
+        with pending_lock:
+            pending_purchase = {
+                "fecha":    format_date_es(date),
+                "monto":    info["monto"],
+                "comercio": info["comercio"],
+            }
+
         text = build_telegram_message(subject, sender, date, info)
         send_telegram(text)
 
@@ -287,11 +403,16 @@ def process_uid(client: IMAPClient, uid: int, check_age: bool = True) -> None:
 
 def monitor() -> None:
     if not GMAIL_USER or not GMAIL_PASSWORD:
-        log.error(
-            "Faltan credenciales. Exporta GMAIL_USER y GMAIL_PASSWORD "
-            "como variables de entorno antes de ejecutar."
-        )
+        log.error("Faltan credenciales Gmail (GMAIL_USER, GMAIL_PASSWORD).")
         raise SystemExit(1)
+
+    if not GOOGLE_CREDENTIALS_JSON or not GOOGLE_SHEET_ID:
+        log.error("Faltan variables GOOGLE_CREDENTIALS_JSON o GOOGLE_SHEET_ID.")
+        raise SystemExit(1)
+
+    # Arrancar hilo de polling de Telegram (escucha respuestas del usuario)
+    t = threading.Thread(target=telegram_polling, daemon=True)
+    t.start()
 
     log.info(f"Conectando a {IMAP_HOST} como {GMAIL_USER} …")
     send_telegram("<b>Monitor Banco de Chile activo</b>")
