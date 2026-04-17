@@ -110,6 +110,28 @@ def save_to_sheets(purchase: dict, que: str, donde: str) -> bool:
         return False
 
 
+def update_in_sheets(purchase: dict, que: str, donde: str) -> bool:
+    try:
+        sheet = get_sheet()
+        all_rows = sheet.get_all_values()
+
+        for idx, row in enumerate(all_rows[1:], start=2):
+            if (len(row) >= 3 and
+                row[0] == purchase["fecha"] and
+                row[1] == purchase["monto"] and
+                row[2] == purchase["comercio"]):
+                sheet.update_cell(idx, 4, que)
+                sheet.update_cell(idx, 5, donde)
+                log.info(f"Gasto actualizado en Google Sheets (fila {idx}).")
+                return True
+
+        log.warning("No se encontró el registro anterior para actualizar.")
+        return False
+    except Exception as exc:
+        log.error(f"Error actualizando en Sheets: {exc}")
+        return False
+
+
 # ─── Telegram ─────────────────────────────────────────────────────────────────
 
 def send_telegram(text: str) -> bool:
@@ -142,7 +164,7 @@ def get_telegram_updates(offset: int) -> list:
         return []
 
 
-def handle_reply(text: str) -> None:
+def handle_reply(text: str, is_edit: bool = False) -> None:
     global pending_purchase
 
     with pending_lock:
@@ -161,18 +183,31 @@ def handle_reply(text: str) -> None:
         que      = parts[0].strip()
         donde    = parts[1].strip()
         purchase = pending_purchase
-        pending_purchase = None
 
-    ok = save_to_sheets(purchase, que, donde)
-    if ok:
-        send_telegram(
-            f"Guardado en Google Sheets.\n"
-            f"<b>{que}</b> en <b>{donde}</b> — <b>${purchase['monto']}</b>"
-        )
-    else:
-        send_telegram("Error al guardar en Google Sheets. Intenta responder de nuevo.")
-        with pending_lock:
-            pending_purchase = purchase  # restaurar para reintentar
+        if is_edit:
+            pending_purchase = None
+            ok = update_in_sheets(purchase, que, donde)
+            if ok:
+                send_telegram(
+                    f"Actualizado en Google Sheets.\n"
+                    f"<b>{que}</b> en <b>{donde}</b>"
+                )
+            else:
+                send_telegram("Error al actualizar. Intenta de nuevo.")
+                with pending_lock:
+                    pending_purchase = purchase
+        else:
+            pending_purchase = None
+            ok = save_to_sheets(purchase, que, donde)
+            if ok:
+                send_telegram(
+                    f"Guardado en Google Sheets.\n"
+                    f"<b>{que}</b> en <b>{donde}</b> — <b>${purchase['monto']}</b>"
+                )
+            else:
+                send_telegram("Error al guardar en Google Sheets. Intenta responder de nuevo.")
+                with pending_lock:
+                    pending_purchase = purchase
 
 
 def telegram_polling() -> None:
@@ -183,15 +218,23 @@ def telegram_polling() -> None:
         updates = get_telegram_updates(last_update_id)
         for upd in updates:
             last_update_id = upd["update_id"] + 1
-            msg = upd.get("message") or upd.get("edited_message")
-            if not msg:
-                continue
-            text    = msg.get("text", "").strip()
-            chat_id = str(msg.get("chat", {}).get("id", ""))
-            if chat_id != str(TELEGRAM_CHAT_ID):
-                continue
-            if text:
-                handle_reply(text)
+
+            # Detectar mensajes nuevos
+            msg = upd.get("message")
+            if msg:
+                text    = msg.get("text", "").strip()
+                chat_id = str(msg.get("chat", {}).get("id", ""))
+                if chat_id == str(TELEGRAM_CHAT_ID) and text:
+                    handle_reply(text, is_edit=False)
+
+            # Detectar mensajes editados
+            edited_msg = upd.get("edited_message")
+            if edited_msg:
+                text    = edited_msg.get("text", "").strip()
+                chat_id = str(edited_msg.get("chat", {}).get("id", ""))
+                if chat_id == str(TELEGRAM_CHAT_ID) and text:
+                    handle_reply(text, is_edit=True)
+
         time.sleep(2)
 
 
