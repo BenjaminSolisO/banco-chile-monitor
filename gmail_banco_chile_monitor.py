@@ -60,9 +60,14 @@ RECONNECT_WAIT = 5          # segundos antes de reconectar tras un error
 
 # ─── Estado global (compra pendiente de clasificar) ───────────────────────────
 
-pending_purchase = None   # dict: {fecha, monto, comercio} — en espera de respuesta del usuario
-last_purchase    = None   # dict: {fecha, monto, comercio} — última compra guardada (para edits)
+pending_purchase = None   # dict: {fecha, monto, comercio, is_frequent, frequent_name}
+last_purchase    = None   # dict: última compra guardada (para edits)
 pending_lock     = threading.Lock()
+
+# ─── Comercios frecuentes ──────────────────────────────────────────────────────
+
+frequent_merchants = set()   # cargado desde Sheet "Frecuentes"
+frequent_lock      = threading.Lock()
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -87,10 +92,53 @@ def get_sheet():
     return gc.open_by_key(GOOGLE_SHEET_ID).sheet1
 
 
+def get_frequent_sheet():
+    """Retorna (o crea) la hoja 'Frecuentes' del spreadsheet."""
+    scopes     = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+    creds      = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    gc         = gspread.authorize(creds)
+    ss         = gc.open_by_key(GOOGLE_SHEET_ID)
+    try:
+        return ss.worksheet("Frecuentes")
+    except gspread.exceptions.WorksheetNotFound:
+        ws = ss.add_worksheet(title="Frecuentes", rows=100, cols=1)
+        ws.append_row(["Comercio"])
+        log.info("Hoja 'Frecuentes' creada.")
+        return ws
+
+
 def ensure_header(sheet) -> None:
     """Crea la fila de encabezado si la hoja está vacía."""
     if not sheet.row_values(1):
         sheet.append_row(SHEET_HEADER)
+
+
+def load_frequent_merchants() -> None:
+    """Carga la lista de comercios frecuentes desde el Sheet."""
+    global frequent_merchants
+    try:
+        ws = get_frequent_sheet()
+        values = ws.col_values(1)
+        loaded = {v.strip().upper() for v in values[1:] if v.strip()}
+        with frequent_lock:
+            frequent_merchants = loaded
+        log.info(f"Comercios frecuentes cargados: {len(frequent_merchants)} comercios.")
+    except Exception as exc:
+        log.error(f"Error cargando comercios frecuentes: {exc}")
+
+
+def find_frequent(comercio: str) -> tuple:
+    """Busca si el comercio está en la lista de frecuentes.
+    Retorna (is_frequent: bool, nombre_limpio: str)."""
+    if not comercio or comercio == "N/D":
+        return False, ""
+    c = comercio.upper()
+    with frequent_lock:
+        for f in frequent_merchants:
+            if f in c:
+                return True, f
+    return False, ""
 
 
 def save_to_sheets(purchase: dict, que: str, donde: str) -> bool:
@@ -180,7 +228,6 @@ def handle_reply(text: str, is_edit: bool = False) -> None:
     global pending_purchase, last_purchase
 
     with pending_lock:
-        # Para edits, buscar en last_purchase; para mensajes nuevos, en pending_purchase
         source = last_purchase if is_edit else pending_purchase
 
         log.debug(f"handle_reply: is_edit={is_edit}, source is None={source is None}")
@@ -189,22 +236,31 @@ def handle_reply(text: str, is_edit: bool = False) -> None:
 
         if source is None:
             log.info(f"handle_reply: No hay compra para procesar (is_edit={is_edit})")
-            return  # no hay compra para procesar, ignorar
-
-        if "/" not in text:
-            send_telegram(
-                "Formato incorrecto. Responde así:\n"
-                "<code>qué compraste / dónde</code>\n"
-                "Ej: <code>ropa / Falabella</code>"
-            )
             return
 
-        parts    = text.split("/", 1)
-        que      = parts[0].strip()
-        donde    = parts[1].strip()
+        frequent = source.get("is_frequent", False)
+        frequent_name = source.get("frequent_name", "")
+
+        if frequent:
+            # Para comercios frecuentes, todo el texto es el "qué"
+            que = text.strip()
+            donde = frequent_name
+            log.info(f"handle_reply: Comercio frecuente detectado: {que} / {donde}")
+        else:
+            # Comportamiento normal: requiere "qué / dónde"
+            if "/" not in text:
+                send_telegram(
+                    "Formato incorrecto. Responde así:\n"
+                    "<code>qué compraste / dónde</code>\n"
+                    "Ej: <code>ropa / Falabella</code>"
+                )
+                return
+            parts = text.split("/", 1)
+            que = parts[0].strip()
+            donde = parts[1].strip()
 
         if is_edit:
-            log.info(f"handle_reply: Editando con last_purchase: {que} / {donde}")
+            log.info(f"handle_reply: Editando: {que} / {donde}")
             ok = update_in_sheets(source, que, donde)
             log.info(f"handle_reply: update_in_sheets retornó ok={ok}")
             if ok:
@@ -215,7 +271,7 @@ def handle_reply(text: str, is_edit: bool = False) -> None:
             else:
                 send_telegram("Error al actualizar. Intenta de nuevo.")
         else:
-            log.info(f"handle_reply: Guardando con pending_purchase: {que} / {donde}")
+            log.info(f"handle_reply: Guardando: {que} / {donde}")
             ok = save_to_sheets(source, que, donde)
             log.info(f"handle_reply: save_to_sheets retornó ok={ok}")
             if ok:
@@ -405,7 +461,7 @@ def format_date_es(date_str: str) -> str:
         return date_str
 
 
-def build_telegram_message(subject: str, sender: str, date: str, info: dict) -> str:
+def build_telegram_message(subject: str, sender: str, date: str, info: dict, frequent: bool = False) -> str:
     monto = info["monto"]
     fecha = format_date_es(date)
 
@@ -415,7 +471,10 @@ def build_telegram_message(subject: str, sender: str, date: str, info: dict) -> 
     else:
         base += f"<b>Asunto:</b> {subject}\n"
 
-    base += "\nResponde: <code>qué compraste / dónde</code>"
+    if frequent:
+        base += "\nResponde: <code>qué compraste</code>"
+    else:
+        base += "\nResponde: <code>qué compraste / dónde</code>"
     return base
 
 
@@ -450,14 +509,18 @@ def process_uid(client: IMAPClient, uid: int, check_age: bool = True) -> None:
         info = extract_alert_info(subject, body)
         log.info(f"UID {uid} — alerta detectada: monto={info['monto']!r} comercio={info['comercio']!r}")
 
+        is_freq, freq_name = find_frequent(info["comercio"])
+
         with pending_lock:
             pending_purchase = {
-                "fecha":    format_date_es(date),
-                "monto":    info["monto"],
-                "comercio": info["comercio"],
+                "fecha":         format_date_es(date),
+                "monto":         info["monto"],
+                "comercio":      info["comercio"],
+                "is_frequent":   is_freq,
+                "frequent_name": freq_name,
             }
 
-        text = build_telegram_message(subject, sender, date, info)
+        text = build_telegram_message(subject, sender, date, info, frequent=is_freq)
         send_telegram(text)
 
     except Exception as exc:
@@ -481,6 +544,7 @@ def monitor() -> None:
 
     log.info(f"Conectando a {IMAP_HOST} como {GMAIL_USER} …")
     send_telegram("<b>Monitor Banco de Chile activo</b>")
+    load_frequent_merchants()
 
     while True:  # loop de reconexion
         try:
