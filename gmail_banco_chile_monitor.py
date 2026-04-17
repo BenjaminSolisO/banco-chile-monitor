@@ -112,28 +112,35 @@ def save_to_sheets(purchase: dict, que: str, donde: str) -> bool:
 
 
 def update_in_sheets(purchase: dict, que: str, donde: str) -> bool:
+    log.info(f"update_in_sheets INICIADA")
     try:
+        log.info(f"update_in_sheets: Conectando a Sheet...")
         sheet = get_sheet()
+        log.info(f"update_in_sheets: Obteniendo todas las filas...")
         all_rows = sheet.get_all_values()
 
-        log.info(f"Buscando: fecha='{purchase['fecha']}' monto='{purchase['monto']}' comercio='{purchase['comercio']}'")
-        log.info(f"Total de filas en Sheet: {len(all_rows)}")
+        log.info(f"update_in_sheets: Buscando: fecha='{purchase['fecha']}' monto='{purchase['monto']}' comercio='{purchase['comercio']}'")
+        log.info(f"update_in_sheets: Total de filas en Sheet: {len(all_rows)}")
 
         for idx, row in enumerate(all_rows[1:], start=2):
-            log.debug(f"Fila {idx}: {row[0:3] if len(row) >= 3 else row}")
+            log.debug(f"update_in_sheets: Fila {idx}: {row[0:3] if len(row) >= 3 else row}")
             if (len(row) >= 3 and
                 row[0] == purchase["fecha"] and
                 row[1] == purchase["monto"] and
                 row[2] == purchase["comercio"]):
+                log.info(f"update_in_sheets: ¡ENCONTRADA! Fila {idx}. Actualizando columnas 4 y 5...")
                 sheet.update_cell(idx, 4, que)
                 sheet.update_cell(idx, 5, donde)
-                log.info(f"Gasto actualizado en Google Sheets (fila {idx}).")
+                log.info(f"update_in_sheets: ✅ Gasto actualizado en Google Sheets (fila {idx}).")
                 return True
 
-        log.warning("No se encontró el registro anterior para actualizar.")
+        log.warning(f"update_in_sheets: ❌ No se encontró el registro anterior para actualizar.")
+        log.warning(f"update_in_sheets: Primeras 3 filas del Sheet:")
+        for idx, row in enumerate(all_rows[:3], start=1):
+            log.warning(f"  Fila {idx}: {row}")
         return False
     except Exception as exc:
-        log.error(f"Error actualizando en Sheets: {exc}")
+        log.error(f"update_in_sheets: ❌ Error: {exc}", exc_info=True)
         return False
 
 
@@ -176,7 +183,12 @@ def handle_reply(text: str, is_edit: bool = False) -> None:
         # Para edits, buscar en last_purchase; para mensajes nuevos, en pending_purchase
         source = last_purchase if is_edit else pending_purchase
 
+        log.debug(f"handle_reply: is_edit={is_edit}, source is None={source is None}")
+        if source:
+            log.debug(f"  source = fecha:{source.get('fecha')} monto:{source.get('monto')} comercio:{source.get('comercio')}")
+
         if source is None:
+            log.info(f"handle_reply: No hay compra para procesar (is_edit={is_edit})")
             return  # no hay compra para procesar, ignorar
 
         if "/" not in text:
@@ -192,7 +204,9 @@ def handle_reply(text: str, is_edit: bool = False) -> None:
         donde    = parts[1].strip()
 
         if is_edit:
+            log.info(f"handle_reply: Editando con last_purchase: {que} / {donde}")
             ok = update_in_sheets(source, que, donde)
+            log.info(f"handle_reply: update_in_sheets retornó ok={ok}")
             if ok:
                 send_telegram(
                     f"Actualizado en Google Sheets.\n"
@@ -201,10 +215,13 @@ def handle_reply(text: str, is_edit: bool = False) -> None:
             else:
                 send_telegram("Error al actualizar. Intenta de nuevo.")
         else:
+            log.info(f"handle_reply: Guardando con pending_purchase: {que} / {donde}")
             ok = save_to_sheets(source, que, donde)
+            log.info(f"handle_reply: save_to_sheets retornó ok={ok}")
             if ok:
                 last_purchase = source
                 pending_purchase = None
+                log.info(f"handle_reply: Asignado last_purchase y limpiado pending_purchase")
                 send_telegram(
                     f"Guardado en Google Sheets.\n"
                     f"<b>{que}</b> en <b>{donde}</b> — <b>${source['monto']}</b>"
