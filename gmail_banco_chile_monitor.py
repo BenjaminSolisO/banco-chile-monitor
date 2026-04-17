@@ -115,7 +115,11 @@ def update_in_sheets(purchase: dict, que: str, donde: str) -> bool:
         sheet = get_sheet()
         all_rows = sheet.get_all_values()
 
+        log.info(f"Buscando: fecha='{purchase['fecha']}' monto='{purchase['monto']}' comercio='{purchase['comercio']}'")
+        log.info(f"Total de filas en Sheet: {len(all_rows)}")
+
         for idx, row in enumerate(all_rows[1:], start=2):
+            log.debug(f"Fila {idx}: {row[0:3] if len(row) >= 3 else row}")
             if (len(row) >= 3 and
                 row[0] == purchase["fecha"] and
                 row[1] == purchase["monto"] and
