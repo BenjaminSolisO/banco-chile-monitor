@@ -225,6 +225,7 @@ def telegram_polling() -> None:
                 text    = msg.get("text", "").strip()
                 chat_id = str(msg.get("chat", {}).get("id", ""))
                 if chat_id == str(TELEGRAM_CHAT_ID) and text:
+                    log.info(f"Mensaje nuevo recibido: {text}")
                     handle_reply(text, is_edit=False)
 
             # Detectar mensajes editados
@@ -233,6 +234,7 @@ def telegram_polling() -> None:
                 text    = edited_msg.get("text", "").strip()
                 chat_id = str(edited_msg.get("chat", {}).get("id", ""))
                 if chat_id == str(TELEGRAM_CHAT_ID) and text:
+                    log.info(f"Mensaje EDITADO recibido: {text}")
                     handle_reply(text, is_edit=True)
 
         time.sleep(2)
