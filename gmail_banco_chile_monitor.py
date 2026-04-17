@@ -60,7 +60,8 @@ RECONNECT_WAIT = 5          # segundos antes de reconectar tras un error
 
 # ─── Estado global (compra pendiente de clasificar) ───────────────────────────
 
-pending_purchase = None   # dict: {fecha, monto, comercio}
+pending_purchase = None   # dict: {fecha, monto, comercio} — en espera de respuesta del usuario
+last_purchase    = None   # dict: {fecha, monto, comercio} — última compra guardada (para edits)
 pending_lock     = threading.Lock()
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
@@ -169,11 +170,14 @@ def get_telegram_updates(offset: int) -> list:
 
 
 def handle_reply(text: str, is_edit: bool = False) -> None:
-    global pending_purchase
+    global pending_purchase, last_purchase
 
     with pending_lock:
-        if pending_purchase is None:
-            return  # no hay compra pendiente, ignorar mensaje
+        # Para edits, buscar en last_purchase; para mensajes nuevos, en pending_purchase
+        source = last_purchase if is_edit else pending_purchase
+
+        if source is None:
+            return  # no hay compra para procesar, ignorar
 
         if "/" not in text:
             send_telegram(
@@ -186,11 +190,9 @@ def handle_reply(text: str, is_edit: bool = False) -> None:
         parts    = text.split("/", 1)
         que      = parts[0].strip()
         donde    = parts[1].strip()
-        purchase = pending_purchase
 
         if is_edit:
-            pending_purchase = None
-            ok = update_in_sheets(purchase, que, donde)
+            ok = update_in_sheets(source, que, donde)
             if ok:
                 send_telegram(
                     f"Actualizado en Google Sheets.\n"
@@ -198,20 +200,17 @@ def handle_reply(text: str, is_edit: bool = False) -> None:
                 )
             else:
                 send_telegram("Error al actualizar. Intenta de nuevo.")
-                with pending_lock:
-                    pending_purchase = purchase
         else:
-            pending_purchase = None
-            ok = save_to_sheets(purchase, que, donde)
+            ok = save_to_sheets(source, que, donde)
             if ok:
+                last_purchase = source
+                pending_purchase = None
                 send_telegram(
                     f"Guardado en Google Sheets.\n"
-                    f"<b>{que}</b> en <b>{donde}</b> — <b>${purchase['monto']}</b>"
+                    f"<b>{que}</b> en <b>{donde}</b> — <b>${source['monto']}</b>"
                 )
             else:
                 send_telegram("Error al guardar en Google Sheets. Intenta responder de nuevo.")
-                with pending_lock:
-                    pending_purchase = purchase
 
 
 def telegram_polling() -> None:
