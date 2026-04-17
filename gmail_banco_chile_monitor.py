@@ -66,7 +66,8 @@ pending_lock     = threading.Lock()
 
 # ─── Comercios frecuentes ──────────────────────────────────────────────────────
 
-frequent_merchants = set()   # cargado desde Sheet "Frecuentes"
+frequent_merchants = set()        # cargado desde Sheet "Frecuentes" (manual)
+auto_frequent      = dict()       # {comercio: count} — detectados automáticamente (5+ en 30 días)
 frequent_lock      = threading.Lock()
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
@@ -128,16 +129,74 @@ def load_frequent_merchants() -> None:
         log.error(f"Error cargando comercios frecuentes: {exc}")
 
 
+def analyze_recent_purchases() -> None:
+    """Analiza los últimos gastos (30 días) y detecta comercios que aparecen 5+ veces."""
+    global auto_frequent
+    try:
+        sheet = get_sheet()
+        all_rows = sheet.get_all_values()
+
+        # Contar comercios en los últimos 30 días
+        from datetime import timedelta
+        cutoff_date = datetime.now() - timedelta(days=30)
+        comercio_count = {}
+
+        for row in all_rows[1:]:  # skip header
+            if len(row) < 3 or not row[2]:
+                continue
+
+            comercio = row[2].strip().upper()
+
+            # Intentar parsear la fecha (formato: "Lunes 15 de abril")
+            try:
+                fecha_str = row[0]
+                # Extraer día y mes del formato español
+                import re
+                m = re.search(r'(\d+)\s+de\s+(\w+)', fecha_str)
+                if m:
+                    day = int(m.group(1))
+                    month_name = m.group(2)
+                    # Mapear mes español a número
+                    months = {"enero": 1, "febrero": 2, "marzo": 3, "abril": 4,
+                              "mayo": 5, "junio": 6, "julio": 7, "agosto": 8,
+                              "septiembre": 9, "octubre": 10, "noviembre": 11, "diciembre": 12}
+                    month = months.get(month_name.lower(), 0)
+                    if month:
+                        # Asumir año actual
+                        fecha = datetime(datetime.now().year, month, day)
+                        if fecha >= cutoff_date:
+                            comercio_count[comercio] = comercio_count.get(comercio, 0) + 1
+            except Exception:
+                continue
+
+        # Guardar solo comercios con 5+ apariciones
+        detected = {c: count for c, count in comercio_count.items() if count >= 5}
+        with frequent_lock:
+            auto_frequent = detected
+
+        log.info(f"Comercios automáticos detectados (5+ en 30 días): {detected}")
+    except Exception as exc:
+        log.error(f"Error analizando compras recientes: {exc}")
+
+
 def find_frequent(comercio: str) -> tuple:
-    """Busca si el comercio está en la lista de frecuentes.
+    """Busca si el comercio está en la lista de frecuentes (manual o automático).
     Retorna (is_frequent: bool, nombre_limpio: str)."""
     if not comercio or comercio == "N/D":
         return False, ""
     c = comercio.upper()
+
     with frequent_lock:
+        # Buscar en lista manual
         for f in frequent_merchants:
             if f in c:
                 return True, f
+
+        # Buscar en comercios automáticos
+        for auto_c in auto_frequent.keys():
+            if auto_c in c:
+                return True, auto_c
+
     return False, ""
 
 
@@ -545,6 +604,7 @@ def monitor() -> None:
     log.info(f"Conectando a {IMAP_HOST} como {GMAIL_USER} …")
     send_telegram("<b>Monitor Banco de Chile activo</b>")
     load_frequent_merchants()
+    analyze_recent_purchases()
 
     while True:  # loop de reconexion
         try:
