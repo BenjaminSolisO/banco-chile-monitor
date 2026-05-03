@@ -283,7 +283,41 @@ def get_telegram_updates(offset: int) -> list:
         return []
 
 
-def handle_reply(text: str, reply_to_msg_id: int = None, is_edit: bool = False) -> None:
+def parse_notification_text(raw: str) -> dict:
+    """Extrae fecha, monto y comercio del texto de una notificación enviada por el bot.
+    Retorna None si no se puede parsear."""
+    try:
+        fecha = monto = comercio = None
+        for line in raw.split("\n"):
+            line = line.strip()
+            if line.startswith("Fecha:"):
+                fecha = line[len("Fecha:"):].strip()
+            elif line.startswith("Monto:"):
+                monto = line[len("Monto:"):].strip().lstrip("$")
+            elif line.startswith("Comercio:"):
+                comercio = line[len("Comercio:"):].strip()
+            elif line.startswith("Asunto:") and monto is None:
+                monto = "N/D"
+
+        if not fecha or not monto:
+            return None
+
+        comercio = comercio or "N/D"
+        is_freq, freq_name = find_frequent(comercio)
+
+        return {
+            "fecha":         fecha,
+            "monto":         monto,
+            "comercio":      comercio,
+            "is_frequent":   is_freq,
+            "frequent_name": freq_name,
+        }
+    except Exception:
+        return None
+
+
+def handle_reply(text: str, reply_to_msg_id: int = None, is_edit: bool = False,
+                reply_to_text: str = None) -> None:
     global pending_purchases, last_purchase
 
     with pending_lock:
@@ -303,6 +337,13 @@ def handle_reply(text: str, reply_to_msg_id: int = None, is_edit: bool = False) 
         log.debug(f"handle_reply: is_edit={is_edit}, source is None={source is None}")
         if source:
             log.debug(f"  source = fecha:{source.get('fecha')} monto:{source.get('monto')} comercio:{source.get('comercio')}")
+
+        if source is None and reply_to_text and not is_edit:
+            parsed = parse_notification_text(reply_to_text)
+            if parsed:
+                log.info(f"handle_reply: fallback — compra reconstruida desde reply: {parsed}")
+                source = parsed
+                target_msg_id = None  # no hay msg_id real, no se puede restaurar
 
         if source is None:
             log.info(f"handle_reply: No hay compra para procesar (is_edit={is_edit})")
@@ -327,7 +368,7 @@ def handle_reply(text: str, reply_to_msg_id: int = None, is_edit: bool = False) 
             que = parts[0].strip()
             donde = parts[1].strip()
 
-        if not is_edit:
+        if not is_edit and target_msg_id is not None:
             pending_purchases.pop(target_msg_id, None)
 
     # ── Guardar o actualizar ──────────────────────────────────────────────────
@@ -350,8 +391,9 @@ def handle_reply(text: str, reply_to_msg_id: int = None, is_edit: bool = False) 
             )
         else:
             send_telegram("Error al guardar en Google Sheets. Intenta responder de nuevo.")
-            with pending_lock:
-                pending_purchases[target_msg_id] = source
+            if target_msg_id is not None:
+                with pending_lock:
+                    pending_purchases[target_msg_id] = source
 
 
 def telegram_polling() -> None:
@@ -371,8 +413,9 @@ def telegram_polling() -> None:
                     log.info(f"Mensaje nuevo recibido: {text}")
                     reply_to = msg.get("reply_to_message", {})
                     reply_to_msg_id = reply_to.get("message_id") if reply_to else None
+                    reply_to_text = reply_to.get("text") if reply_to else None
                     try:
-                        handle_reply(text, reply_to_msg_id=reply_to_msg_id, is_edit=False)
+                        handle_reply(text, reply_to_msg_id=reply_to_msg_id, reply_to_text=reply_to_text)
                     except Exception as exc:
                         log.error(f"Error en handle_reply: {exc}", exc_info=True)
 
@@ -537,6 +580,7 @@ def format_date_es(date_str: str) -> str:
 
 def build_telegram_message(subject: str, sender: str, date: str, info: dict, frequent: bool = False) -> str:
     monto = info["monto"]
+    comercio = info.get("comercio", "N/D")
     fecha = format_date_es(date)
 
     base = f"<b>Alerta Banco de Chile</b>\n<b>Fecha:</b> {fecha}\n"
@@ -544,6 +588,8 @@ def build_telegram_message(subject: str, sender: str, date: str, info: dict, fre
         base += f"<b>Monto:</b> ${monto}\n"
     else:
         base += f"<b>Asunto:</b> {subject}\n"
+    if comercio != "N/D":
+        base += f"<b>Comercio:</b> {comercio}\n"
 
     if frequent:
         base += "\nResponde: <code>qué compraste</code>"
