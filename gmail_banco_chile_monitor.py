@@ -306,6 +306,8 @@ def handle_reply(text: str, reply_to_msg_id: int = None, is_edit: bool = False) 
 
         if source is None:
             log.info(f"handle_reply: No hay compra para procesar (is_edit={is_edit})")
+            if not is_edit:
+                send_telegram("No hay compras pendientes para registrar. ¿Reinició el bot?")
             return
 
         # ── Formato según tipo de compra ────────────────────────────────────────
@@ -369,7 +371,10 @@ def telegram_polling() -> None:
                     log.info(f"Mensaje nuevo recibido: {text}")
                     reply_to = msg.get("reply_to_message", {})
                     reply_to_msg_id = reply_to.get("message_id") if reply_to else None
-                    handle_reply(text, reply_to_msg_id=reply_to_msg_id, is_edit=False)
+                    try:
+                        handle_reply(text, reply_to_msg_id=reply_to_msg_id, is_edit=False)
+                    except Exception as exc:
+                        log.error(f"Error en handle_reply: {exc}", exc_info=True)
 
             # Detectar mensajes editados
             edited_msg = upd.get("edited_message")
@@ -378,7 +383,10 @@ def telegram_polling() -> None:
                 chat_id = str(edited_msg.get("chat", {}).get("id", ""))
                 if chat_id == str(TELEGRAM_CHAT_ID) and text:
                     log.info(f"Mensaje EDITADO recibido: {text}")
-                    handle_reply(text, is_edit=True)
+                    try:
+                        handle_reply(text, is_edit=True)
+                    except Exception as exc:
+                        log.error(f"Error en handle_reply (edit): {exc}", exc_info=True)
         time.sleep(2)
 
 
