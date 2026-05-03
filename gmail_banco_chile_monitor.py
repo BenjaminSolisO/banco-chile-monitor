@@ -58,10 +58,10 @@ MAX_AGE_MINUTES = 15
 IDLE_TIMEOUT   = 29 * 60   # 29 min — el servidor puede cortar a los 30 min
 RECONNECT_WAIT = 5          # segundos antes de reconectar tras un error
 
-# ─── Estado global (compra pendiente de clasificar) ───────────────────────────
+# ─── Estado global (compras pendientes de clasificar) ──────────────────────────
 
-pending_purchase = None   # dict: {fecha, monto, comercio}
-pending_lock     = threading.Lock()
+pending_purchases = {}   # dict: message_id -> {fecha, monto, comercio}
+pending_lock      = threading.Lock()
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -112,8 +112,8 @@ def save_to_sheets(purchase: dict, que: str, donde: str) -> bool:
 
 # ─── Telegram ─────────────────────────────────────────────────────────────────
 
-def send_telegram(text: str) -> bool:
-    """Envía un mensaje HTML a Telegram. Retorna True si fue exitoso."""
+def send_telegram(text: str):
+    """Envía un mensaje HTML a Telegram. Retorna el message_id si fue exitoso, None si falló."""
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
@@ -123,10 +123,10 @@ def send_telegram(text: str) -> bool:
         resp = requests.post(f"{TELEGRAM_API_URL}/sendMessage", json=payload, timeout=10)
         resp.raise_for_status()
         log.info("Notificacion Telegram enviada.")
-        return True
+        return resp.json().get("result", {}).get("message_id")
     except requests.RequestException as exc:
         log.error(f"Error enviando a Telegram: {exc}")
-        return False
+        return None
 
 
 def get_telegram_updates(offset: int) -> list:
@@ -142,12 +142,20 @@ def get_telegram_updates(offset: int) -> list:
         return []
 
 
-def handle_reply(text: str) -> None:
-    global pending_purchase
+def handle_reply(text: str, reply_to_msg_id: int = None) -> None:
+    global pending_purchases
 
     with pending_lock:
-        if pending_purchase is None:
-            return  # no hay compra pendiente, ignorar mensaje
+        if reply_to_msg_id and reply_to_msg_id in pending_purchases:
+            target_msg_id = reply_to_msg_id
+        elif pending_purchases:
+            target_msg_id = max(pending_purchases.keys())
+        else:
+            target_msg_id = None
+
+        if target_msg_id is None:
+            send_telegram("No hay compras pendientes para registrar.")
+            return
 
         if "/" not in text:
             send_telegram(
@@ -160,8 +168,7 @@ def handle_reply(text: str) -> None:
         parts    = text.split("/", 1)
         que      = parts[0].strip()
         donde    = parts[1].strip()
-        purchase = pending_purchase
-        pending_purchase = None
+        purchase = pending_purchases.pop(target_msg_id)
 
     ok = save_to_sheets(purchase, que, donde)
     if ok:
@@ -172,7 +179,7 @@ def handle_reply(text: str) -> None:
     else:
         send_telegram("Error al guardar en Google Sheets. Intenta responder de nuevo.")
         with pending_lock:
-            pending_purchase = purchase  # restaurar para reintentar
+            pending_purchases[target_msg_id] = purchase
 
 
 def telegram_polling() -> None:
@@ -191,7 +198,9 @@ def telegram_polling() -> None:
             if chat_id != str(TELEGRAM_CHAT_ID):
                 continue
             if text:
-                handle_reply(text)
+                reply_to = msg.get("reply_to_message", {})
+                reply_to_msg_id = reply_to.get("message_id") if reply_to else None
+                handle_reply(text, reply_to_msg_id)
         time.sleep(2)
 
 
@@ -361,7 +370,7 @@ def process_uid(client: IMAPClient, uid: int, check_age: bool = True) -> None:
     check_age=False en el loop de poll (ya filtrado por watermark).
     check_age=True en startup para no reprocesar emails viejos.
     """
-    global pending_purchase
+    global pending_purchases
     try:
         data = client.fetch([uid], ["RFC822"])
         raw  = data[uid][b"RFC822"]
@@ -385,15 +394,15 @@ def process_uid(client: IMAPClient, uid: int, check_age: bool = True) -> None:
         info = extract_alert_info(subject, body)
         log.info(f"UID {uid} — alerta detectada: monto={info['monto']!r} comercio={info['comercio']!r}")
 
-        with pending_lock:
-            pending_purchase = {
-                "fecha":    format_date_es(date),
-                "monto":    info["monto"],
-                "comercio": info["comercio"],
-            }
-
         text = build_telegram_message(subject, sender, date, info)
-        send_telegram(text)
+        msg_id = send_telegram(text)
+        if msg_id:
+            with pending_lock:
+                pending_purchases[msg_id] = {
+                    "fecha":    format_date_es(date),
+                    "monto":    info["monto"],
+                    "comercio": info["comercio"],
+                }
 
     except Exception as exc:
         log.error(f"Error procesando UID {uid}: {exc}")
