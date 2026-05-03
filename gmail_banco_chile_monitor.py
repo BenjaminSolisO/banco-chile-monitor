@@ -60,8 +60,15 @@ RECONNECT_WAIT = 5          # segundos antes de reconectar tras un error
 
 # ─── Estado global (compras pendientes de clasificar) ──────────────────────────
 
-pending_purchases = {}   # dict: message_id -> {fecha, monto, comercio}
+pending_purchases = {}   # dict: message_id -> {fecha, monto, comercio, is_frequent, frequent_name}
+last_purchase    = None   # dict: última compra guardada (para edits)
 pending_lock      = threading.Lock()
+
+# ─── Comercios frecuentes ──────────────────────────────────────────────────────
+
+frequent_merchants = set()        # cargado desde Sheet "Frecuentes" (manual)
+auto_frequent      = dict()       # {comercio: count} — detectados automáticamente (5+ en 30 días)
+frequent_lock      = threading.Lock()
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -86,10 +93,111 @@ def get_sheet():
     return gc.open_by_key(GOOGLE_SHEET_ID).sheet1
 
 
+def get_frequent_sheet():
+    """Retorna (o crea) la hoja 'Frecuentes' del spreadsheet."""
+    scopes     = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+    creds      = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    gc         = gspread.authorize(creds)
+    ss         = gc.open_by_key(GOOGLE_SHEET_ID)
+    try:
+        return ss.worksheet("Frecuentes")
+    except gspread.exceptions.WorksheetNotFound:
+        ws = ss.add_worksheet(title="Frecuentes", rows=100, cols=1)
+        ws.append_row(["Comercio"])
+        log.info("Hoja 'Frecuentes' creada.")
+        return ws
+
+
 def ensure_header(sheet) -> None:
     """Crea la fila de encabezado si la hoja está vacía."""
     if not sheet.row_values(1):
         sheet.append_row(SHEET_HEADER)
+
+
+def load_frequent_merchants() -> None:
+    """Carga la lista de comercios frecuentes desde el Sheet."""
+    global frequent_merchants
+    try:
+        ws = get_frequent_sheet()
+        values = ws.col_values(1)
+        loaded = {v.strip().upper() for v in values[1:] if v.strip()}
+        with frequent_lock:
+            frequent_merchants = loaded
+        log.info(f"Comercios frecuentes cargados: {len(frequent_merchants)} comercios.")
+    except Exception as exc:
+        log.error(f"Error cargando comercios frecuentes: {exc}")
+
+
+def analyze_recent_purchases() -> None:
+    """Analiza los últimos gastos (30 días) y detecta comercios que aparecen 5+ veces."""
+    global auto_frequent
+    try:
+        sheet = get_sheet()
+        all_rows = sheet.get_all_values()
+
+        # Contar comercios en los últimos 30 días
+        from datetime import timedelta
+        cutoff_date = datetime.now() - timedelta(days=30)
+        comercio_count = {}
+
+        for row in all_rows[1:]:  # skip header
+            if len(row) < 3 or not row[2]:
+                continue
+
+            comercio = row[2].strip().upper()
+
+            # Intentar parsear la fecha (formato: "Lunes 15 de abril")
+            try:
+                fecha_str = row[0]
+                # Extraer día y mes del formato español
+                import re
+                m = re.search(r'(\d+)\s+de\s+(\w+)', fecha_str)
+                if m:
+                    day = int(m.group(1))
+                    month_name = m.group(2)
+                    # Mapear mes español a número
+                    months = {"enero": 1, "febrero": 2, "marzo": 3, "abril": 4,
+                              "mayo": 5, "junio": 6, "julio": 7, "agosto": 8,
+                              "septiembre": 9, "octubre": 10, "noviembre": 11, "diciembre": 12}
+                    month = months.get(month_name.lower(), 0)
+                    if month:
+                        # Asumir año actual
+                        fecha = datetime(datetime.now().year, month, day)
+                        if fecha >= cutoff_date:
+                            comercio_count[comercio] = comercio_count.get(comercio, 0) + 1
+            except Exception:
+                continue
+
+        # Guardar solo comercios con 5+ apariciones
+        detected = {c: count for c, count in comercio_count.items() if count >= 5}
+        with frequent_lock:
+            auto_frequent = detected
+
+        log.info(f"Comercios automáticos detectados (5+ en 30 días): {detected}")
+    except Exception as exc:
+        log.error(f"Error analizando compras recientes: {exc}")
+
+
+def find_frequent(comercio: str) -> tuple:
+    """Busca si el comercio está en la lista de frecuentes (manual o automático).
+    Retorna (is_frequent: bool, nombre_limpio: str)."""
+    if not comercio or comercio == "N/D":
+        return False, ""
+    c = comercio.upper()
+
+    with frequent_lock:
+        # Buscar en lista manual
+        for f in frequent_merchants:
+            if f in c:
+                return True, f
+
+        # Buscar en comercios automáticos
+        for auto_c in auto_frequent.keys():
+            if auto_c in c:
+                return True, auto_c
+
+    return False, ""
 
 
 def save_to_sheets(purchase: dict, que: str, donde: str) -> bool:
@@ -107,6 +215,39 @@ def save_to_sheets(purchase: dict, que: str, donde: str) -> bool:
         return True
     except Exception as exc:
         log.error(f"Error guardando en Sheets: {exc}")
+        return False
+
+
+def update_in_sheets(purchase: dict, que: str, donde: str) -> bool:
+    log.info(f"update_in_sheets INICIADA")
+    try:
+        log.info(f"update_in_sheets: Conectando a Sheet...")
+        sheet = get_sheet()
+        log.info(f"update_in_sheets: Obteniendo todas las filas...")
+        all_rows = sheet.get_all_values()
+
+        log.info(f"update_in_sheets: Buscando: fecha='{purchase['fecha']}' monto='{purchase['monto']}' comercio='{purchase['comercio']}'")
+        log.info(f"update_in_sheets: Total de filas en Sheet: {len(all_rows)}")
+
+        for idx, row in enumerate(all_rows[1:], start=2):
+            log.debug(f"update_in_sheets: Fila {idx}: {row[0:3] if len(row) >= 3 else row}")
+            if (len(row) >= 3 and
+                row[0] == purchase["fecha"] and
+                row[1] == purchase["monto"] and
+                row[2] == purchase["comercio"]):
+                log.info(f"update_in_sheets: ¡ENCONTRADA! Fila {idx}. Actualizando columnas 4 y 5...")
+                sheet.update_cell(idx, 4, que)
+                sheet.update_cell(idx, 5, donde)
+                log.info(f"update_in_sheets: ✅ Gasto actualizado en Google Sheets (fila {idx}).")
+                return True
+
+        log.warning(f"update_in_sheets: ❌ No se encontró el registro anterior para actualizar.")
+        log.warning(f"update_in_sheets: Primeras 3 filas del Sheet:")
+        for idx, row in enumerate(all_rows[:3], start=1):
+            log.warning(f"  Fila {idx}: {row}")
+        return False
+    except Exception as exc:
+        log.error(f"update_in_sheets: ❌ Error: {exc}", exc_info=True)
         return False
 
 
@@ -142,44 +283,73 @@ def get_telegram_updates(offset: int) -> list:
         return []
 
 
-def handle_reply(text: str, reply_to_msg_id: int = None) -> None:
-    global pending_purchases
+def handle_reply(text: str, reply_to_msg_id: int = None, is_edit: bool = False) -> None:
+    global pending_purchases, last_purchase
 
     with pending_lock:
-        if reply_to_msg_id and reply_to_msg_id in pending_purchases:
+        if is_edit:
+            source = last_purchase
+            target_msg_id = None
+        elif reply_to_msg_id and reply_to_msg_id in pending_purchases:
             target_msg_id = reply_to_msg_id
+            source = pending_purchases[target_msg_id]
         elif pending_purchases:
             target_msg_id = max(pending_purchases.keys())
+            source = pending_purchases[target_msg_id]
         else:
+            source = None
             target_msg_id = None
 
-        if target_msg_id is None:
-            send_telegram("No hay compras pendientes para registrar.")
+        log.debug(f"handle_reply: is_edit={is_edit}, source is None={source is None}")
+        if source:
+            log.debug(f"  source = fecha:{source.get('fecha')} monto:{source.get('monto')} comercio:{source.get('comercio')}")
+
+        if source is None:
+            log.info(f"handle_reply: No hay compra para procesar (is_edit={is_edit})")
             return
 
-        if "/" not in text:
+        # ── Formato según tipo de compra ────────────────────────────────────────
+        if source.get("is_frequent"):
+            que = text.strip()
+            donde = source.get("frequent_name", "")
+            log.info(f"handle_reply: Comercio frecuente detectado: {que} / {donde}")
+        else:
+            if "/" not in text:
+                send_telegram(
+                    "Formato incorrecto. Responde así:\n"
+                    "<code>qué compraste / dónde</code>\n"
+                    "Ej: <code>ropa / Falabella</code>"
+                )
+                return
+            parts = text.split("/", 1)
+            que = parts[0].strip()
+            donde = parts[1].strip()
+
+        if not is_edit:
+            pending_purchases.pop(target_msg_id, None)
+
+    # ── Guardar o actualizar ──────────────────────────────────────────────────
+    if is_edit:
+        ok = update_in_sheets(source, que, donde)
+        if ok:
             send_telegram(
-                "Formato incorrecto. Responde así:\n"
-                "<code>qué compraste / dónde</code>\n"
-                "Ej: <code>ropa / Falabella</code>"
+                f"Actualizado en Google Sheets.\n"
+                f"<b>{que}</b> en <b>{donde}</b>"
             )
-            return
-
-        parts    = text.split("/", 1)
-        que      = parts[0].strip()
-        donde    = parts[1].strip()
-        purchase = pending_purchases.pop(target_msg_id)
-
-    ok = save_to_sheets(purchase, que, donde)
-    if ok:
-        send_telegram(
-            f"Guardado en Google Sheets.\n"
-            f"<b>{que}</b> en <b>{donde}</b> — <b>${purchase['monto']}</b>"
-        )
+        else:
+            send_telegram("Error al actualizar. Intenta de nuevo.")
     else:
-        send_telegram("Error al guardar en Google Sheets. Intenta responder de nuevo.")
-        with pending_lock:
-            pending_purchases[target_msg_id] = purchase
+        ok = save_to_sheets(source, que, donde)
+        if ok:
+            last_purchase = source
+            send_telegram(
+                f"Guardado en Google Sheets.\n"
+                f"<b>{que}</b> en <b>{donde}</b> — <b>${source['monto']}</b>"
+            )
+        else:
+            send_telegram("Error al guardar en Google Sheets. Intenta responder de nuevo.")
+            with pending_lock:
+                pending_purchases[target_msg_id] = source
 
 
 def telegram_polling() -> None:
@@ -190,17 +360,25 @@ def telegram_polling() -> None:
         updates = get_telegram_updates(last_update_id)
         for upd in updates:
             last_update_id = upd["update_id"] + 1
-            msg = upd.get("message") or upd.get("edited_message")
-            if not msg:
-                continue
-            text    = msg.get("text", "").strip()
-            chat_id = str(msg.get("chat", {}).get("id", ""))
-            if chat_id != str(TELEGRAM_CHAT_ID):
-                continue
-            if text:
-                reply_to = msg.get("reply_to_message", {})
-                reply_to_msg_id = reply_to.get("message_id") if reply_to else None
-                handle_reply(text, reply_to_msg_id)
+            # Detectar mensajes nuevos
+            msg = upd.get("message")
+            if msg:
+                text    = msg.get("text", "").strip()
+                chat_id = str(msg.get("chat", {}).get("id", ""))
+                if chat_id == str(TELEGRAM_CHAT_ID) and text:
+                    log.info(f"Mensaje nuevo recibido: {text}")
+                    reply_to = msg.get("reply_to_message", {})
+                    reply_to_msg_id = reply_to.get("message_id") if reply_to else None
+                    handle_reply(text, reply_to_msg_id=reply_to_msg_id, is_edit=False)
+
+            # Detectar mensajes editados
+            edited_msg = upd.get("edited_message")
+            if edited_msg:
+                text    = edited_msg.get("text", "").strip()
+                chat_id = str(edited_msg.get("chat", {}).get("id", ""))
+                if chat_id == str(TELEGRAM_CHAT_ID) and text:
+                    log.info(f"Mensaje EDITADO recibido: {text}")
+                    handle_reply(text, is_edit=True)
         time.sleep(2)
 
 
@@ -349,7 +527,7 @@ def format_date_es(date_str: str) -> str:
         return date_str
 
 
-def build_telegram_message(subject: str, sender: str, date: str, info: dict) -> str:
+def build_telegram_message(subject: str, sender: str, date: str, info: dict, frequent: bool = False) -> str:
     monto = info["monto"]
     fecha = format_date_es(date)
 
@@ -359,7 +537,10 @@ def build_telegram_message(subject: str, sender: str, date: str, info: dict) -> 
     else:
         base += f"<b>Asunto:</b> {subject}\n"
 
-    base += "\nResponde: <code>qué compraste / dónde</code>"
+    if frequent:
+        base += "\nResponde: <code>qué compraste</code>"
+    else:
+        base += "\nResponde: <code>qué compraste / dónde</code>"
     return base
 
 
@@ -394,14 +575,18 @@ def process_uid(client: IMAPClient, uid: int, check_age: bool = True) -> None:
         info = extract_alert_info(subject, body)
         log.info(f"UID {uid} — alerta detectada: monto={info['monto']!r} comercio={info['comercio']!r}")
 
-        text = build_telegram_message(subject, sender, date, info)
+        is_freq, freq_name = find_frequent(info["comercio"])
+
+        text = build_telegram_message(subject, sender, date, info, frequent=is_freq)
         msg_id = send_telegram(text)
         if msg_id:
             with pending_lock:
                 pending_purchases[msg_id] = {
-                    "fecha":    format_date_es(date),
-                    "monto":    info["monto"],
-                    "comercio": info["comercio"],
+                    "fecha":         format_date_es(date),
+                    "monto":         info["monto"],
+                    "comercio":      info["comercio"],
+                    "is_frequent":   is_freq,
+                    "frequent_name": freq_name,
                 }
 
     except Exception as exc:
@@ -425,6 +610,8 @@ def monitor() -> None:
 
     log.info(f"Conectando a {IMAP_HOST} como {GMAIL_USER} …")
     send_telegram("<b>Monitor Banco de Chile activo</b>")
+    load_frequent_merchants()
+    analyze_recent_purchases()
 
     while True:  # loop de reconexion
         try:
