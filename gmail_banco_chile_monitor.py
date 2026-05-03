@@ -200,13 +200,31 @@ def find_frequent(comercio: str) -> tuple:
     return False, ""
 
 
+def clean_monto(raw: str):
+    """Convierte un monto en formato chileno ('1.400,50' o '1.400') a número (float o int).
+    Retorna el número, o el string original si no se puede convertir."""
+    if not raw or raw == "N/D":
+        return raw
+    try:
+        s = raw.strip().lstrip("$").strip()
+        if "," in s:
+            s = s.replace(".", "").replace(",", ".")
+            return float(s)
+        else:
+            s = s.replace(".", "").replace(",", ".")
+            return int(s) if s.isdigit() else float(s)
+    except (ValueError, AttributeError):
+        return raw
+
+
 def save_to_sheets(purchase: dict, que: str, donde: str) -> bool:
     try:
         sheet = get_sheet()
         ensure_header(sheet)
+        monto_num = clean_monto(purchase["monto"])
         sheet.append_row([
             purchase["fecha"],
-            purchase["monto"],
+            monto_num,
             purchase["comercio"],
             que,
             donde,
@@ -233,7 +251,7 @@ def update_in_sheets(purchase: dict, que: str, donde: str) -> bool:
             log.debug(f"update_in_sheets: Fila {idx}: {row[0:3] if len(row) >= 3 else row}")
             if (len(row) >= 3 and
                 row[0] == purchase["fecha"] and
-                row[1] == purchase["monto"] and
+                str(clean_monto(row[1])) == str(clean_monto(purchase["monto"])) and
                 row[2] == purchase["comercio"]):
                 log.info(f"update_in_sheets: ¡ENCONTRADA! Fila {idx}. Actualizando columnas 4 y 5...")
                 sheet.update_cell(idx, 4, que)
